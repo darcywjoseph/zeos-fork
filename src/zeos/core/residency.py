@@ -230,12 +230,30 @@ def plan_eviction(
     chosen: list[EvictionCandidate] = []
     skipped: list[EvictionCandidate] = []
     projected = resident_tokens
+    # A stub's content is already in the store; the way back is a fault on the
+    # segment it replaced, so evicting the stub itself archives nothing.
+    originals = {r.stub_id: r.id for r in table.stubbed() if r.stub_id is not None}
 
     for record in ordered:
         if projected <= policy.low_mark:
             break
         stub_tokens, _ = stub_size(record.tokens)
         freed = record.tokens - stub_tokens
+        if record.id in originals:
+            skipped.append(
+                EvictionCandidate(
+                    record=record,
+                    stub_tokens=stub_tokens,
+                    freed=freed,
+                    refault_risk=min(1.0, record.attn.ema),
+                    net_positive=False,
+                    reason=(
+                        f"already the stub of segment {originals[record.id]}; "
+                        "fault that segment to get the span back"
+                    ),
+                )
+            )
+            continue
         # P(refault) estimated from the EMA: a warm span is likely to be wanted
         # again. Crude, and labelled as such -- it is the clock's skip rule, and its
         # calibration is exactly what E3 exists to measure on real attention.
