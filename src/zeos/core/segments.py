@@ -422,8 +422,8 @@ class SegmentTable:
         costs nothing to render again and is already in the window in its current form.
 
         Paying ``STUB_FRAMING_TOKENS`` to remember such a value is not merely wasteful
-        but self-defeating: ``stub_size`` exceeds the span for anything under about
-        eleven tokens, so a status region handed to ``plan_eviction`` is declined for
+        but self-defeating: ``stub_size`` is no smaller than the span for anything up to
+        thirteen tokens, so a status region handed to ``plan_eviction`` is declined for
         the life of the job and its tokens are never reclaimed at all.
 
         No record survives. Provenance is not lost with it -- the journal holds the

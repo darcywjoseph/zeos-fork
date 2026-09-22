@@ -35,8 +35,8 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 
-from zeos.core.ids import EvictionPolicy, Perm
-from zeos.core.segments import SegmentRecord, SegmentTable
+from zeos.core.ids import EvictionPolicy, Integrity, Perm, PipeName, Principal, Ring, SegmentId
+from zeos.core.segments import Provenance, SegmentRecord, SegmentTable
 
 __all__ = [
     "ContextPolicy",
@@ -54,26 +54,6 @@ __all__ = [
 
 #: Attention EMA above which a segment counts as part of the working set.
 DEFAULT_THETA_WS = 0.05
-
-#: Tokens the stub framing costs before any summary text -- the
-#: ``<STUB id=... segment=... ring=... integrity=... tokens=...>`` header and
-#: its closing tag. It is a floor on stub size, and therefore a floor on how
-#: small a span can usefully be: evicting a span barely larger than its own
-#: framing frees nothing and costs a refault.
-STUB_FRAMING_TOKENS = 9
-
-
-def stub_size(span_tokens: int) -> tuple[int, int]:
-    """Return ``(total_stub_tokens, summary_budget)`` for a span.
-
-    The planner and the executor must agree on this number. They did not in the
-    first cut -- the planner assumed a stub a quarter the size of the span while
-    the executor emitted framing plus summary -- with the result that every
-    "eviction" made the window *larger* and the job evicted itself in circles.
-    A single shared function is the fix, and the reason it is exported.
-    """
-    summary_budget = max(2, span_tokens // 8)
-    return STUB_FRAMING_TOKENS + summary_budget, summary_budget
 
 
 @dataclass(frozen=True, slots=True)
@@ -180,6 +160,36 @@ def summarise(tokens: Sequence[object], *, budget: int) -> str:
     if len(words) > budget:
         head += f" ... (+{len(words) - budget} tokens elided)"
     return head
+
+
+#: Every field ``render_stub`` reads renders as one token, so any record measures alike.
+_PLACEHOLDER = SegmentRecord(
+    id=SegmentId(0),
+    start=0,
+    end=0,
+    ring=Ring.KERNEL,
+    integrity=Integrity(0),
+    perms=Perm.R,
+    provenance=Provenance(pipe=PipeName("stub"), principal=Principal.KERNEL, injected_at=0),
+)
+
+
+def stub_size(span_tokens: int) -> tuple[int, int]:
+    """Return ``(total_stub_tokens, summary_budget)`` for a span.
+
+    The planner subtracts this and the executor splices in ``render_stub``; the two
+    must agree, so the size is measured by rendering, never computed beside it.
+    """
+    summary_budget = max(2, span_tokens // 8)
+    summary = summarise(["w"] * span_tokens, budget=summary_budget)
+    return len(render_stub(_PLACEHOLDER, summary, store_id="0" * 32).split()), summary_budget
+
+
+#: Tokens a stub costs beyond its summary: the ``<STUB ...>`` header, the closing
+#: tag and the elision note. It is a floor on stub size, and therefore a floor on
+#: how small a span can usefully be: evicting a span barely larger than its own
+#: framing frees nothing and costs a refault.
+STUB_FRAMING_TOKENS = stub_size(64)[0] - stub_size(64)[1]
 
 
 def plan_eviction(

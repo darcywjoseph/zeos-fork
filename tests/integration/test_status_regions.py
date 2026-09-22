@@ -14,8 +14,8 @@ can keep something it must not lose.
 
 Which is why a refresh has to *remove* what it supersedes, and why removal cannot be
 delegated to the pager. Eviction exists for spans that might be wanted again, and pays
-``STUB_FRAMING_TOKENS`` for a handle to fault them back with; ``stub_size`` therefore
-exceeds the span for anything under about eleven tokens, so a status region handed to
+``STUB_FRAMING_TOKENS`` for a handle to fault them back with; ``stub_size`` is therefore
+no smaller than the span for anything up to thirteen tokens, so a status region handed to
 ``plan_eviction`` yields ``freed <= 0``, is marked net-negative, and is declined at every
 boundary for the life of the job. Merely dropping ``Perm.W`` closes the leak on paper and
 leaves it open in fact: the copies stay resident, and only the line of code refusing to

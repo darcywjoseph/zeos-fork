@@ -3380,8 +3380,8 @@ class Kernel:
         its content is ``world.get(obj)``, and the replacement is about to be appended
         -- so there is nothing to spill and nothing to fault back. Handing it to the
         pager instead does not work even in principle: ``stub_size`` is
-        ``STUB_FRAMING_TOKENS + max(2, n // 8)``, which exceeds ``n`` for any span
-        under about eleven tokens, so ``plan_eviction`` computes ``freed <= 0``, marks
+        ``STUB_FRAMING_TOKENS + max(2, n // 8)``, which is no smaller than ``n`` for any
+        span up to thirteen tokens, so ``plan_eviction`` computes ``freed <= 0``, marks
         the candidate net-negative and declines it at every boundary for the life of
         the job. Demotion alone closes the leak on paper only.
 
