@@ -110,6 +110,10 @@ class SpanStore:
     def refs(self, store_id: StoreId) -> int:
         return self._refs.get(store_id, 0)
 
+    def spans(self) -> tuple[ArchivedSpan, ...]:
+        """Every entry, in the order it was first archived."""
+        return tuple(self._spans.values())
+
     @property
     def unique_spans(self) -> int:
         return len(self._spans)

@@ -1315,6 +1315,37 @@
     host.appendChild(rows);
   }
 
+  /* The span store as of this frame: the dump's entries whose first archive is at or
+   * before it, each counted by the stub rows that name it so far. */
+  function drawStore() {
+    var host = $("store");
+    clear(host);
+    if (!F || F.store === null || F.store === undefined) {
+      host.appendChild(el("p", "empty",
+        "No span store loaded. Run with --store and pass the file to debug."));
+      return;
+    }
+    var refs = {};
+    (F.contexts || []).forEach(function (row) {
+      if (row[0] <= at && row[1] === "stub") refs[row[5]] = (refs[row[5]] || 0) + 1;
+    });
+    var shown = F.store.filter(function (row) { return row[0] <= at; });
+    if (!shown.length) {
+      host.appendChild(el("p", "empty", "Nothing archived yet."));
+      return;
+    }
+    var rows = el("div", "rows");
+    shown.forEach(function (row) {
+      var id = row[1], tokens = row[2];
+      var line = el("div", "row" + (row[0] === at ? " changed" : ""));
+      line.appendChild(el("span", "k", id.slice(0, 8) + "  ×" + (refs[id] || 0) +
+        "  " + tokens.length + " tokens  seg " + row[6]));
+      line.appendChild(el("span", "v", tokens.join(" ")));
+      rows.appendChild(line);
+    });
+    host.appendChild(rows);
+  }
+
   function drawFaults() {
     var host = $("faults");
     clear(host);
@@ -1475,6 +1506,7 @@
     contextOptions();
     drawContext();
     drawWorld();
+    drawStore();
     drawFaults();
 
     if (!F || !F.count) return;

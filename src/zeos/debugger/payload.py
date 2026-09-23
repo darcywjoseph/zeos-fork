@@ -627,14 +627,42 @@ def _trace_log(rows: Sequence[Mapping[str, Any]], *, every: int, count: int) -> 
     ]
 
 
+def _store_log(
+    rows: Sequence[Mapping[str, Any]], contexts: Sequence[Sequence[Any]]
+) -> list[list[Any]]:
+    """The span store keyed to the frame that first archived each entry, which the
+    ``stub`` rows of the context log record.
+
+    Rows are ``[frame, store_id, tokens, refs, ring, integrity, origin]``.
+    """
+    first: dict[str, int] = {}
+    for frame, op, *rest in contexts:
+        if op == "stub":
+            first.setdefault(rest[3], frame)
+    return [
+        [
+            first.get(row["store_id"], 0),
+            row["store_id"],
+            [t["text"] for t in row["tokens"]],
+            row["refs"],
+            row["ring"],
+            row["integrity"],
+            row["origin"],
+        ]
+        for row in rows
+    ]
+
+
 def frames(
     records: Iterable[JournalRecord],
     *,
     every: int = 1,
     trace: Sequence[Mapping[str, Any]] | None = None,
+    store: Sequence[Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Fold a journal into a scrubbable, delta-encoded timeline. ``trace`` is the
-    machine's account when one was written; ``None`` means the page has none to offer."""
+    machine's account and ``store`` the kernel's span store, when either was written;
+    ``None`` means the page has none to offer."""
     records = list(records)
     timeline = fold((r.event for r in records), every=every)
     views = [_encode(f) for f in timeline.frames]
@@ -647,18 +675,21 @@ def frames(
             "tokens": [],
             "contexts": [],
             "trace": None if trace is None else [],
+            "store": None if store is None else [],
             "ticks": [],
             "count": 0,
         }
     deltas = [_delta(a, b) for a, b in zip(views, views[1:], strict=False)]
+    contexts = _context_log(records, every=every, count=len(views))
     return {
         "base": views[0],
         "deltas": deltas,
         "marks": [[index, label] for index, label in timeline.marks],
         "lanes": _lanes(views),
         "tokens": _token_log(records, every=every, count=len(views)),
-        "contexts": _context_log(records, every=every, count=len(views)),
+        "contexts": contexts,
         "trace": None if trace is None else _trace_log(trace, every=every, count=len(views)),
+        "store": None if store is None else _store_log(store, contexts),
         "ticks": _tick_starts(views),
         "count": len(views),
     }
@@ -671,6 +702,7 @@ def build_payload(
     findings: Sequence[Finding] = (),
     every: int = 1,
     trace: Sequence[Mapping[str, Any]] | None = None,
+    store: Sequence[Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """The page's entire input.
 
@@ -687,5 +719,5 @@ def build_payload(
         "kinds": dict(MARKED_KINDS),
     }
     if records is not None:
-        payload["frames"] = frames(records, every=every, trace=trace)
+        payload["frames"] = frames(records, every=every, trace=trace, store=store)
     return payload
