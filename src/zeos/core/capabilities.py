@@ -91,6 +91,22 @@ class FieldSpec:
                     return f"string of {len(raw)} exceeds max_length {self.max_length}"
         return None
 
+    def describe(self) -> str:
+        """What this field accepts, in words a notice may repeat.
+
+        Derived from the declaration and never from a payload, which is the whole point:
+        a notice built from this cannot contain anything a model or a device chose.
+        """
+        match self.kind:
+            case FieldKind.NUMBER:
+                return "a number"
+            case FieldKind.BOOL:
+                return "true or false"
+            case FieldKind.ENUM:
+                return f"one of {', '.join(self.choices)}"
+            case FieldKind.STRING:
+                return "text" if self.max_length is None else f"text of up to {self.max_length}"
+
     def capacity_bits(self) -> float:
         """Upper bound on attacker-chosen information this field can carry.
 
@@ -152,6 +168,19 @@ class Schema:
             if error := self.fields[key].validate(values[key]):
                 return f"schema {self.name!r}: field {key!r}: {error}"
         return None
+
+    def describe(self) -> str:
+        """The shape this schema accepts, for a notice.
+
+        ``validate`` returns a detail written for somebody reading the journal, and it
+        quotes the payload so that the refusal is diagnosable. That detail must not reach
+        the job: the payload is the writer's own words, and a notice carrying them would
+        put them in the job's context at ring 0 with the kernel's provenance. This is the
+        half that is safe to say, and it is built from the declaration alone.
+        """
+        if self.bare_choices:
+            return f"one of {', '.join(self.bare_choices)}"
+        return ", ".join(f"{key} {spec.describe()}" for key, spec in sorted(self.fields.items()))
 
     def capacity_bits(self) -> float:
         """Total upper bound on smuggling capacity through this schema."""
@@ -272,6 +301,12 @@ class CheckResult:
     required: Integrity
     fault: FaultKind | None = None
     detail: str = ""
+    #: What the job may be told, when the detail is not it.
+    #:
+    #: Set by the checks whose detail quotes what the writer wrote. The caller cannot work
+    #: this out for itself: whether a detail is safe to inject depends on *why* the write
+    #: was refused, which is known here and nowhere else.
+    notice: str | None = None
 
 
 def check_write(
@@ -333,6 +368,13 @@ def check_write(
                 required=capability.min_integrity,
                 fault=FaultKind.CAPABILITY,
                 detail=error,
+                # The detail quotes the payload so a human can see what was wrong with it.
+                # The job is told what the pipe takes instead, which is everything it needs
+                # to correct itself and none of its own words back.
+                notice=(
+                    f"what you wrote is not the shape {capability.schema.name!r} takes: "
+                    f"{capability.schema.describe()}"
+                ),
             )
 
     if capability.rate is not None and not capability.rate.admit(now_ns):

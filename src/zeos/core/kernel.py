@@ -2638,13 +2638,20 @@ class Kernel:
         if not check.allowed:
             # A pipe the descriptor binds is the author's word; any other name is the
             # model's, and the notice must not repeat it.
+            #
+            # That settles the pipe *name*, and not everything else a detail may quote. A
+            # write refused for its payload rather than its destination is refused on a
+            # pipe the descriptor does bind, so the name is safe and the payload is not:
+            # `check.notice` is how a check that knows its detail quotes the writer says
+            # so, and it wins over the test on the name.
             bound = pipe_name in job.descriptor.pipes.all_names()
             history = self._demotion_history(job)
+            notice = check.notice if check.notice is not None else (None if bound else NOT_WRITABLE)
             self._refuse(
                 job,
                 check.fault or FaultKind.CAPABILITY,
                 check.detail + history,
-                notice=None if bound else NOT_WRITABLE + history,
+                notice=None if notice is None else notice + history,
                 pipe=pipe_name,
             )
             return
