@@ -78,6 +78,7 @@ pipes, particular world objects and particular thresholds. Cases live with the d
 needs them, under [`demo/`](https://github.com/metacognitionai/zeos/blob/main/demo/README.md), and nothing in `src/zeos/` imports from
 there.
 
+Additional demonstration applications built on ZEOS can be found in our [zeos-demos repository](https://github.com/metacognitionai/zeos-demos).
 
 ## Citing ZEOS
 
