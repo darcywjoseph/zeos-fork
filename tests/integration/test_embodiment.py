@@ -24,7 +24,7 @@ crane, with none of it written twice.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 import pytest
@@ -100,6 +100,7 @@ def build(
     descriptors: Sequence[Mapping[str, Any]],
     scripts: Mapping[str, list[dict[str, Any]]],
     platforms: Sequence[PlatformProfile] = FLEET,
+    on_event: Callable[[Event], None] | None = None,
 ) -> tuple[Kernel, list[Event]]:
     events: list[Event] = []
     kernel = Kernel(
@@ -113,6 +114,7 @@ def build(
         resources=ResourceTable(),
         platforms=platforms,
         journal_sink=events,
+        on_event=on_event,
         config=KernelConfig(case="f0"),
     )
     kernel.start()
@@ -309,6 +311,45 @@ def test_the_release_policy_sets_how_long_the_holder_keeps_the_body() -> None:
     after_grace = decodes_kept(ReleasePolicy.PLAN_STEP)
     assert at_once == 0, at_once
     assert after_grace >= ReleasePolicy.grace(ReleasePolicy.PLAN_STEP) - 1, after_grace
+
+
+def test_a_driver_hears_the_body_being_taken_as_it_happens() -> None:
+    """The platform is the body's driver, and a revocation must reach it at once: with a seat
+    that blocks inside ``tick``, the journal is read too late to stop what the body was doing."""
+    heard: list[tuple[int, bool]] = []
+    box: dict[str, Kernel] = {}
+
+    def hear(event: Event) -> None:
+        if isinstance(event, Disembodied) and "outranks" in event.reason:
+            kernel = box["kernel"]
+            heard.append((len(kernel.events), kernel.leases.lease_of(event.job) is None))
+
+    slow = dict(CARRY, name="slow-carry", priority=90)
+    urgent = dict(CARRY, name="urgent-carry", priority=10)
+    kernel, events = build(
+        [slow, urgent],
+        {"slow-carry": LONG_WORK, "urgent-carry": WORK},
+        platforms=(CARRIER_7,),
+        on_event=hear,
+    )
+    box["kernel"] = kernel
+    holder = kernel.spawn(DescriptorName("slow-carry"))
+    kernel.tick()
+    kernel.tick()
+    claimant = kernel.spawn(DescriptorName("urgent-carry"))
+    kernel.run_until_quiescent()
+
+    taken = next(
+        i for i, e in enumerate(events) if isinstance(e, Disembodied) and "outranks" in e.reason
+    )
+    regranted = next(
+        i for i, e in enumerate(events) if isinstance(e, Embodied) and e.job == claimant.job_id
+    )
+    assert heard == [(taken + 1, True)], (
+        heard
+    )  # told as the event is journalled, the lease already gone
+    assert taken < regranted
+    assert holder.state is JobState.DONE
 
 
 def test_completion_returns_the_body() -> None:

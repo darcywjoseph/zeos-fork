@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import math
 import sys
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 
 from zeos.core.allocator import (
@@ -325,6 +325,7 @@ class Kernel:
         topology: Topology | None = None,
         link: LinkPort | None = None,
         journal_sink: list[Event] | None = None,
+        on_event: Callable[[Event], None] | None = None,
         config: KernelConfig | None = None,
     ) -> None:
         self.descriptors = dict(descriptors)
@@ -356,6 +357,7 @@ class Kernel:
         self.store = SpanStore()
         self.pager = Pager(self.store)
         self._events: list[Event] = journal_sink if journal_sink is not None else []
+        self._on_event = on_event
         self._counters = _Counters()
         self._started = False
 
@@ -366,7 +368,12 @@ class Kernel:
         return self._events
 
     def _emit(self, event: Event) -> None:
+        """Journal the event, then tell the driver that asked to hear events as they
+        happen. The call is made here, on the kernel's thread, so a driver can act
+        the moment a body is taken from its job rather than once ``tick`` returns."""
         self._events.append(event)
+        if self._on_event is not None:
+            self._on_event(event)
         if self.config.trace_decode and isinstance(event, Decoded):
             print(
                 f"[t={event.clock.token_clock}] job {event.job} seg {event.segment}: "
