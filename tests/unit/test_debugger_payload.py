@@ -46,7 +46,7 @@ from zeos.core.ids import (
     SegmentId,
 )
 from zeos.core.kernel import Kernel, KernelConfig
-from zeos.core.pipes import PipeTable
+from zeos.core.pipes import PipeSpec, PipeTable
 from zeos.core.vectors import VectorTable
 from zeos.debugger.payload import (
     CONTEXT_OPS,
@@ -114,9 +114,9 @@ def test_structure_carries_the_declared_wiring(bundle: CaseBundle) -> None:
 def test_edges_follow_the_declared_bindings(bundle: CaseBundle) -> None:
     """Every edge the diagram draws is a binding somebody wrote down.
 
-    The direction is the alias convention, which is the approximation
-    ``payload.ALIAS_KIND`` documents -- so it is asserted here rather than assumed,
-    and a schema that one day declares direction will fail this test loudly.
+    None of these pipes declares an outside end, so the direction is the alias
+    convention, which is the approximation ``payload.ALIAS_KIND`` documents -- so it is
+    asserted here rather than assumed. A pipe that does declare one is the next test.
     """
     edges = {(e.get("descriptor"), e["pipe"], e["kind"]) for e in structure(bundle)["edges"]}
 
@@ -126,6 +126,41 @@ def test_edges_follow_the_declared_bindings(bundle: CaseBundle) -> None:
 
     actuates = [e for e in structure(bundle)["edges"] if e["kind"] == "actuates"]
     assert actuates == [{"kind": "actuates", "pipe": "actuators.unit_a", "object": "plant.unit_a"}]
+
+
+def test_a_devices_pipes_say_which_way_they_run() -> None:
+    """A sink and a device pipe declare their direction, whatever a job calls them.
+
+    A job writes a sink and the driver drains it; an adapter writes a device pipe and
+    a job reads it. Bound under aliases the convention does not know, both would be
+    drawn as both ways -- which left every pipe between a job and its devices with a
+    writer and a reader, so the diagram drew none of them.
+    """
+    job = Descriptor.from_frontmatter(
+        {
+            "name": "pick-place",
+            "priority": 60,
+            "pipes": {"ask": "claude.asks", "hear": "claude.replies", "chat": "peer.chat"},
+        },
+        body="pick and place",
+        source="<test>",
+    )
+    pipes = (
+        PipeSpec(name=PipeName("claude.asks"), sink=True),
+        PipeSpec(name=PipeName("claude.replies"), device=True),
+        PipeSpec(name=PipeName("peer.chat")),
+    )
+    made = CaseBundle(name="devices", descriptors={job.name: job}, scripts={}, pipes=pipes)
+    view = structure(made)
+
+    kinds = {e["alias"]: e["kind"] for e in view["edges"]}
+    assert kinds == {"ask": "write", "hear": "read", "chat": "duplex"}
+    flags = {p["name"]: (p["device"], p["sink"]) for p in view["pipes"]}
+    assert flags == {
+        "claude.asks": (False, True),
+        "claude.replies": (True, False),
+        "peer.chat": (False, False),
+    }
 
 
 def test_a_mapped_object_is_an_edge_of_its_own() -> None:

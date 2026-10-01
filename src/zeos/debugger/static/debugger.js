@@ -67,6 +67,11 @@
   /* Priority is the diagram's vertical axis, so it gets an axis column of its own
    * rather than a caption floating over the left gutter's chips. */
   var AXIS = 84;
+  /* A device is one box: a header with its name, then a row per pipe it shares with
+   * the jobs, which is where that pipe's edges end. Every job that talks to a device
+   * sends it a request and takes back a result, so its edges come in pairs, and its
+   * column stands DEVICE_GAP further out than the sinks' to give their labels room. */
+  var DEVICE_HEAD = 22, PORT_H = 24, DEVICE_GAP = 120;
 
   var $ = function (id) { return document.getElementById(id); };
 
@@ -79,7 +84,7 @@
   var contextJob = "";
   var folded = {};
   var rawOn = false;
-  var keyframes = [], ctxKeyframes = [], rawKeyframes = [], nodes = {}, chips = {}, objects = {};
+  var keyframes = [], ctxKeyframes = [], rawKeyframes = [], nodes = {}, chips = {}, objects = {}, devices = {};
   var playing = false, timer = null;
 
   /* Which edge kinds are drawn. Layout ignores this entirely -- see buildLayout --
@@ -503,13 +508,34 @@
   }
 
   function chipName(chip) {
-    return chip.pipe ? chip.pipe.name : chip.object;
+    return chip.pipe ? chip.pipe.name : chip.object || chip.name;
+  }
+
+  /* The device a pipe is the outside end of, or null. A job writes a sink for the
+   * outside world and reads a device pipe an adapter writes; the pipes of one device
+   * share the name before the first dot -- claude.asks and claude.replies are Claude.
+   * A device pipe no job binds is only an interrupt source and keeps a chip of its
+   * own, and an actuator's other end is a world object rather than a device. */
+  function deviceOf(p, role) {
+    if (p.world_object || !(p.device || p.sink)) return null;
+    if (!role.writers.length && !role.readers.length) return null;
+    return p.name.split(".")[0];
+  }
+
+  /* The alias a descriptor binds a pipe by: on a device's edges it says what the pipe
+   * is for, where the box beside it already names the pipe. */
+  function aliasOf(descriptor, pipe) {
+    var edge = S.edges.find(function (e) {
+      return e.alias && e.descriptor === descriptor && e.pipe === pipe;
+    });
+    return edge ? edge.alias : pipe;
   }
 
   function buildLayout() {
     nodes = {};
     chips = {};
     objects = {};
+    devices = {};
 
     var bands = [];
     S.descriptors.forEach(function (d) {
@@ -550,6 +576,14 @@
     var lefts = [], rights = [];
     S.pipes.forEach(function (p) {
       var role = roles(p.name);
+      var device = deviceOf(p, role);
+      if (device) {
+        if (!devices[device]) {
+          devices[device] = { name: device, pipes: [], x: rightX + DEVICE_GAP, side: "right" };
+        }
+        devices[device].pipes.push(p);
+        return;
+      }
       var side = null;
       if (p.world_object) side = "right";
       else if (!role.writers.length) side = "left";
@@ -590,6 +624,24 @@
       rights.push(chip);
     });
 
+    /* A device sits level with the jobs it talks to, in its column beyond the sinks',
+     * and is packed with them so that neither overlaps the other. */
+    Object.keys(devices).sort().forEach(function (name) {
+      var box = devices[name];
+      box.pipes.sort(function (a, b) { return byKey(a.name, b.name); });
+      var ys = [];
+      box.pipes.forEach(function (p) {
+        var role = roles(p.name);
+        role.writers.concat(role.readers).forEach(function (n) {
+          if (nodes[n]) ys.push(nodes[n].y);
+        });
+      });
+      box.height = DEVICE_HEAD + box.pipes.length * PORT_H + 4;
+      box.y = (ys.length ? ys.reduce(function (a, b) { return a + b; }, 0) / ys.length : PAD) +
+        (NODE_H - box.height) / 2;
+      rights.push(box);
+    });
+
     /* Pack each gutter downward so chips never overlap. Deterministic: sorted by the
      * y they wanted, then pushed apart in that order. */
     [lefts, rights].forEach(function (column) {
@@ -599,14 +651,22 @@
       var floorY = PAD;
       column.forEach(function (chip) {
         chip.y = Math.max(chip.y, floorY);
-        floorY = chip.y + CHIP_H + 14;
+        floorY = chip.y + (chip.height || CHIP_H) + 14;
+      });
+    });
+
+    /* Only now that the boxes have settled do their rows have a place to end edges. */
+    Object.keys(devices).forEach(function (name) {
+      var box = devices[name];
+      box.pipes.forEach(function (p, i) {
+        chips[p.name] = { pipe: p, x: box.x, y: box.y + DEVICE_HEAD + i * PORT_H, side: "port" };
       });
     });
 
     var bottom = Math.max(
       y,
       lefts.length ? lefts[lefts.length - 1].y + CHIP_H : 0,
-      rights.length ? rights[rights.length - 1].y + CHIP_H : 0
+      rights.length ? rights[rights.length - 1].y + (rights[rights.length - 1].height || CHIP_H) : 0
     );
     /* Status regions run in a lane of their own beneath everything. Routed straight,
      * they cross whatever nodes stand between the world column and the job that maps
@@ -617,7 +677,7 @@
     var mapped = S.edges.some(function (e) { return e.kind === "maps"; });
     return {
       rows: rows,
-      width: rightX + CHIP_W + PAD,
+      width: rightX + (Object.keys(devices).length ? DEVICE_GAP : 0) + CHIP_W + PAD,
       height: (mapped ? mapsLane + 16 : bottom) + PAD,
       left: left,
       gutterX: gutterX,
@@ -668,13 +728,13 @@
     return from.y < to.y ? vcurve(a.bottom, b.top) : vcurve(a.top, b.bottom);
   }
 
-  function midpoint(path, host) {
+  function midpoint(path, host, along) {
     var probe = svg("path", { d: path });
     probe.setAttribute("visibility", "hidden");
     host.appendChild(probe);
     var point;
     try {
-      point = probe.getPointAtLength(probe.getTotalLength() / 2);
+      point = probe.getPointAtLength(probe.getTotalLength() * (along || 0.5));
     } catch (err) {
       point = { x: 0, y: 0 };  /* jsdom and friends have no path geometry */
     }
@@ -740,7 +800,7 @@
         return j.blocked_on === spec.name;
       });
 
-      function paint(path, extra) {
+      function paint(path, extra, label, along) {
         var classes = ["edge", "ring" + spec.ring];
         if (extra) classes.push(extra);
         if (depth > 0) classes.push("busy"); else classes.push("idle");
@@ -755,13 +815,51 @@
           spec.name + " -- ring " + spec.ring + ", " + depth + "/" +
           spec.capacity_tokens + " tokens";
         edgeLayer.appendChild(node);
-        var point = midpoint(path, edgeLayer);
+        if (label === "") return;  // another edge of the same pipe already says it
+        var point = midpoint(path, edgeLayer, along);
         var text = svg("text", {
           class: "edge-label" + (depth > 0 ? " busy" : ""),
           x: point.x, y: point.y - 4, "text-anchor": "middle"
         });
-        text.textContent = spec.name + (depth > 0 ? " (" + depth + ")" : "");
+        text.textContent = (label || spec.name) + (depth > 0 ? " (" + depth + ")" : "");
         labelLayer.appendChild(text);
+      }
+
+      /* A device's row: a request leaves its job just above the job's middle and a
+       * result comes back just below it, so the two never share a line. The labels sit
+       * near the device, where its rows have fanned the edges apart; at the midpoint
+       * every edge of a job is still bunched beside it. */
+      if (chip && chip.side === "port") {
+        var port = [chip.x, chip.y + PORT_H / 2];
+        /* Jobs that bind a pipe under the same alias would print it twice, one label
+         * over the other where their edges meet at the row: the first says it. */
+        var said = {};
+        var once = function (name) {
+          var alias = aliasOf(name, spec.name);
+          if (said[alias]) return "";
+          said[alias] = true;
+          return alias;
+        };
+        if (show.pipes) {
+          role.writers.forEach(function (name) {
+            if (!nodes[name]) return;
+            var from = anchors(nodes[name]).right;
+            paint(curve([from[0], from[1] - 8], port, 0), null, once(name), 0.8);
+          });
+          role.readers.forEach(function (name) {
+            if (!nodes[name]) return;
+            var to = anchors(nodes[name]).right;
+            paint(curve(port, [to[0], to[1] + 8], 0), null, once(name), 0.2);
+          });
+        }
+        if (show.vectors) {
+          role.vectors.forEach(function (edge) {
+            if (!nodes[edge.descriptor]) return;
+            var to = anchors(nodes[edge.descriptor]).right;
+            paint(curve(port, [to[0], to[1] + 8], 0), "interrupt");
+          });
+        }
+        return;
       }
 
       if (chip && chip.side === "left") {
@@ -839,12 +937,46 @@
     });
 
     var drawnChips = {};
-    Object.keys(chips).forEach(function (name) { drawnChips[chipName(chips[name])] = chips[name]; });
+    Object.keys(chips).forEach(function (name) {
+      if (chips[name].side === "port") return;  // drawn as a row of its device
+      drawnChips[chipName(chips[name])] = chips[name];
+    });
     Object.keys(objects).forEach(function (obj) { drawnChips[chipName(objects[obj])] = objects[obj]; });
     Object.keys(drawnChips).sort().forEach(function (key) {
       drawChip(nodeLayer, drawnChips[key]);
     });
+    Object.keys(devices).sort().forEach(function (name) { drawDevice(nodeLayer, devices[name]); });
     S.descriptors.forEach(function (d) { drawNode(nodeLayer, nodes[d.name]); });
+  }
+
+  /* A device: its name, then a row per pipe in that pipe's ring colour, with the tokens
+   * waiting in it. Which way each pipe runs is on its edges' arrows. */
+  function drawDevice(host, box) {
+    var group = svg("g", {
+      class: "chip device",
+      transform: "translate(" + box.x + "," + box.y + ")"
+    });
+    group.appendChild(svg("rect", { width: CHIP_W, height: box.height }));
+    var title = svg("text", { class: "device-name", x: 8, y: 15 });
+    title.textContent = box.name;
+    group.appendChild(title);
+    var kind = svg("text", { class: "sub", x: CHIP_W - 8, y: 15, "text-anchor": "end" });
+    kind.textContent = "device";
+    group.appendChild(kind);
+    box.pipes.forEach(function (p, i) {
+      var live = pipeState(p.name);
+      var depth = live ? live.depth : 0;
+      var row = svg("g", {
+        class: "chip ring" + p.ring,
+        transform: "translate(4," + (DEVICE_HEAD + i * PORT_H + 2) + ")"
+      });
+      row.appendChild(svg("rect", { width: CHIP_W - 8, height: PORT_H - 4 }));
+      var name = svg("text", { x: 6, y: 14 });
+      name.textContent = p.name + (depth > 0 ? " (" + depth + ")" : "");
+      row.appendChild(name);
+      group.appendChild(row);
+    });
+    host.appendChild(group);
   }
 
   function drawChip(host, chip) {

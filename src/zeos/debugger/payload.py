@@ -60,6 +60,7 @@ from zeos.core.events import (
     Spliced,
 )
 from zeos.core.gates import GateTable
+from zeos.core.pipes import PipeSpec
 from zeos.core.principals import PrincipalTable
 from zeos.descriptor.lint import Finding
 from zeos.descriptor.loader import CaseBundle
@@ -79,15 +80,18 @@ __all__ = [
     "structure",
 ]
 
-#: Which way tokens travel on a binding, by the alias's conventional role.
+#: Which way tokens travel on a binding, by the alias's conventional role, for a pipe
+#: that does not declare its outside end.
 #:
 #: **A declared approximation.** ``PipeBindings`` records a name per alias and no
 #: direction, so this is convention rather than fact: ``stdin`` is the blocking read
 #: source, ``stdout`` the output sink, and ``tools`` is a write followed by a read of
 #: the result (core §4.2). Any other binding -- ``reset-count`` reaching a second
-#: actuator through ``peer:`` -- could be either, so it is drawn as both. The journal
-#: is ground truth once there is one: observed reads and writes are what the animated
-#: view lights up, and a declared edge nothing ever travels is itself worth seeing.
+#: actuator through ``peer:`` -- could be either, so it is drawn as both. A pipe that
+#: is a device's end says which way it runs, and that wins over the alias: see
+#: ``_binding_kind``. The journal is ground truth once there is one: observed reads and
+#: writes are what the animated view lights up, and a declared edge nothing ever
+#: travels is itself worth seeing.
 ALIAS_KIND: Mapping[str, str] = {"stdin": "read", "stdout": "write", "tools": "duplex"}
 
 #: Frame sections that are lists of rows with a stable key, so a delta can carry one
@@ -181,15 +185,29 @@ def _bindings(d: Descriptor) -> list[tuple[str, str]]:
     return pairs
 
 
+def _binding_kind(alias: str, spec: PipeSpec | None) -> str:
+    """Which way tokens travel on one binding. A sink is written by jobs and drained for
+    the outside world, and a device pipe is written by an adapter and read by jobs, so a
+    job can only write the one and read the other, whatever it calls them; any other
+    pipe falls back to the alias convention. A binding to an undeclared pipe has no
+    spec: that is a lint finding the page shows, not a reason to refuse the drawing."""
+    if spec is not None and spec.sink:
+        return "write"
+    if spec is not None and spec.device:
+        return "read"
+    return ALIAS_KIND.get(alias, "duplex")
+
+
 def _edges(bundle: CaseBundle) -> list[dict[str, Any]]:
     """Every declared connection, derived once here so the renderer draws rather than
     reconstructs."""
     edges: list[dict[str, Any]] = []
+    specs = {str(p.name): p for p in bundle.pipes}
     for name in sorted(bundle.descriptors):
         for alias, pipe in _bindings(bundle.descriptors[name]):
             edges.append(
                 {
-                    "kind": ALIAS_KIND.get(alias, "duplex"),
+                    "kind": _binding_kind(alias, specs.get(pipe)),
                     "descriptor": str(name),
                     "pipe": pipe,
                     "alias": alias,
@@ -272,6 +290,7 @@ def structure(bundle: CaseBundle, findings: Sequence[Finding] = ()) -> dict[str,
                 "capacity_tokens": p.capacity_tokens,
                 "transport": p.transport,
                 "device": p.device,
+                "sink": p.sink,
                 "world_object": p.world_object,
             }
             for p in sorted(bundle.pipes, key=lambda p: p.name)
