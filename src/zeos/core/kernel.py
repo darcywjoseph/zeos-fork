@@ -40,6 +40,7 @@ from zeos.core.allocator import (
     GreedyAllocator,
     Lease,
     LeaseBook,
+    ReleasePolicy,
     self_state,
 )
 from zeos.core.capabilities import Capability, CapabilityTable, check_write
@@ -299,6 +300,7 @@ class _Counters:
     next_job_id: int = 1
     next_seq: int = 0
     next_segment: int = 1
+    ticks: int = 0
 
 
 #: The notice for a write outside what the job may write: it names, never quotes.
@@ -805,8 +807,10 @@ class Kernel:
         if not self._started:
             raise KernelError("call start() before tick()")
 
+        self._counters.ticks += 1
         self._expire_elevations()
         self._expire_gates()
+        self._enforce_revocations()
         self._dispatch_due_vectors()
 
         contender = self.sched.should_preempt()
@@ -820,7 +824,7 @@ class Kernel:
 
         job = self.sched.running
         if job is None:
-            return False
+            return bool(self.leases.revoking)
 
         if self._check_budget(job):
             return True
@@ -1569,8 +1573,44 @@ class Kernel:
                 ),
             )
             return False
-        self._do_acquire(job, lease_name(allocation.candidates[0].platform))
+        platform = allocation.candidates[0].platform
+        self._claim_body(job, platform)
+        self._do_acquire(job, lease_name(platform))
         return False
+
+    def _claim_body(self, job: Job, platform: str) -> None:
+        """A more urgent job needs a body another holds: the holder's lease is revoked,
+        after the grace its release policy allows.
+
+        Per the Fleet design, body preemption follows the rule of token preemption: a
+        higher mission takes the body and the loser suspends. Base priorities decide,
+        as for a deadlock victim: by now inheritance has lent the holder the waiter's
+        own priority. The revocation is booked here and enforced by ``tick`` once
+        due; the waiter blocks on the lease meanwhile and is woken by the release.
+        """
+        lease = self.leases.leases.get(platform)
+        if lease is None or platform in self.leases.revoking or not self.sched.has(lease.job):
+            return
+        holder = self.sched.get(lease.job)
+        if job.base_priority < holder.base_priority:
+            grace = ReleasePolicy.grace(lease.release_policy)
+            self.leases.revoking[platform] = self._counters.ticks + grace
+
+    def _enforce_revocations(self) -> None:
+        """Every tick: a booked revocation whose grace has passed takes the body back,
+        for the most urgent job waiting on its lease. If nobody waits any more, the
+        booking is dropped and the holder keeps the body."""
+        for platform, due in list(self.leases.revoking.items()):
+            if self._counters.ticks < due:
+                continue
+            waiter = self.resources.next_waiter(lease_name(platform), self._priorities())
+            if waiter is None or not self.sched.has(waiter):
+                self.leases.revoking.pop(platform, None)
+                continue
+            claimant = self.sched.get(waiter)
+            self.revoke_lease(
+                platform, reason=f"job {claimant.job_id} ({claimant.name}) outranks the holder"
+            )
 
     def _grant_lease(self, job: Job, platform: str, release_policy: str, gang: str) -> None:
         profile = self.leases.profiles[platform]
