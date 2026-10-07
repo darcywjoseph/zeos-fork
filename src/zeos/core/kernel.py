@@ -71,6 +71,7 @@ from zeos.core.events import (
     Endorsed,
     Event,
     FaultDispatched,
+    FaultEscalated,
     FaultRaised,
     Forked,
     FrameSent,
@@ -130,7 +131,7 @@ from zeos.core.events import (
     WorkingSetSampled,
     WorldWritten,
 )
-from zeos.core.faults import Fault, FaultAction, resolve
+from zeos.core.faults import Fault, FaultAction, render_escalation, resolve
 from zeos.core.framing import frame_tokens, imitates_frame
 from zeos.core.gates import (
     ALLOW,
@@ -3094,16 +3095,20 @@ class Kernel:
     def _wake_writers(self, pipe: Pipe) -> None:
         """Space freed: anyone blocked writing to this pipe may now proceed."""
         for woken in self.sched.wake_all(pipe.take_waiting_writers()):
-            self._release_priority_inheritance(woken)
-            self._emit(JobWoken(clock=self.clock, job=woken.job_id, pipe=pipe.name))
-            self._emit(
-                JobStateChanged(
-                    clock=self.clock,
-                    job=woken.job_id,
-                    from_state=JobState.BLOCKED,
-                    to_state=JobState.READY,
-                )
+            self._woken(woken, pipe.name)
+
+    def _woken(self, job: Job, pipe_name: PipeName) -> None:
+        """Journal a wake from a pipe and hand back any priority the job lent."""
+        self._release_priority_inheritance(job)
+        self._emit(JobWoken(clock=self.clock, job=job.job_id, pipe=pipe_name))
+        self._emit(
+            JobStateChanged(
+                clock=self.clock,
+                job=job.job_id,
+                from_state=JobState.BLOCKED,
+                to_state=JobState.READY,
             )
+        )
 
     def _wake_readers(self, pipe_name: PipeName) -> None:
         # A pinned job has never run, so it is not among the pipe's blocked readers:
@@ -3123,16 +3128,7 @@ class Kernel:
             self._consume_read(pinned, pipe_name)
         pipe = self.pipes.get(pipe_name)
         for woken in self.sched.wake_all(pipe.take_waiting_readers()):
-            self._release_priority_inheritance(woken)
-            self._emit(JobWoken(clock=self.clock, job=woken.job_id, pipe=pipe_name))
-            self._emit(
-                JobStateChanged(
-                    clock=self.clock,
-                    job=woken.job_id,
-                    from_state=JobState.BLOCKED,
-                    to_state=JobState.READY,
-                )
-            )
+            self._woken(woken, pipe_name)
 
     def _apply_world_write(
         self,
@@ -3762,9 +3758,35 @@ class Kernel:
                 self._transition(job, JobState.FAULTED)
                 self._return_body(job, reason="job faulted")
                 self._release_held_resources(job)
+                if resolution.action is FaultAction.ESCALATE:
+                    self._escalate(job, fault)
             case FaultAction.DISPATCH_HANDLER:
                 self._inject_kernel(job, resolution.notice)
                 if resolution.handler is not None:
                     self.spawn(resolution.handler, parent=job.job_id)
             case FaultAction.CONTINUE | FaultAction.RETRY:
                 self._inject_kernel(job, resolution.notice)
+
+    def _escalate(self, child: Job, fault: Fault) -> None:
+        """Tell a live parent its child faulted, and wake it if it is parked on a read."""
+        if child.parent is None or not self.sched.has(child.parent):
+            return
+        parent = self.sched.get(child.parent)
+        if parent.state.is_terminal:
+            return
+        self._emit(
+            FaultEscalated(
+                clock=self.clock, job=parent.job_id, child=child.job_id, fault=fault.kind
+            )
+        )
+        self._inject_kernel(parent, render_escalation(fault, child.name))
+        waiting = parent.pending_select or ((parent.pending_read,) if parent.pending_read else ())
+        if parent.state is not JobState.BLOCKED or not waiting:
+            return
+        # A woken reader would retry its read and park again, so the read is dropped.
+        for name in waiting:
+            self.pipes.get(name).unblock(parent.job_id)
+        parent.pending_read = None
+        parent.pending_select = ()
+        self.sched.wake(parent)
+        self._woken(parent, waiting[0])

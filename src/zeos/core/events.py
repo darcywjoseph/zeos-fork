@@ -944,6 +944,18 @@ class FaultDispatched(Event):
 
 @event_class
 @dataclass(frozen=True)
+class FaultEscalated(Event):
+    """A job faulted under ``escalate`` and its parent, ``job``, was told."""
+
+    KIND: ClassVar[str] = "fault.escalated"
+
+    job: JobId
+    child: JobId
+    fault: FaultKind
+
+
+@event_class
+@dataclass(frozen=True)
 class SpoofDetected(Event):
     """Attempted mimicry of control framing. The imposter is already inert by
     construction; this exists because attempted injection is worth alarming on even

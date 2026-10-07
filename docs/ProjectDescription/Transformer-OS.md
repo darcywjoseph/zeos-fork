@@ -334,6 +334,9 @@ need training?
 - Faults (budget exceeded, tool error, deadline miss, scheduler starvation)
   are interrupts targeting the faulting job's `on_fault` policy -- same
   mechanism, so error handling is also just descriptors.
+- `escalate`, the default, ends the job as `abort` does and tells its parent: a
+  `<FAULT kind=… child=…>` notice in the parent's context, which also wakes a
+  parent waiting on a read. A job with no live parent is only ended.
 
 ## Appendix A -- Scheduler state machine
 
