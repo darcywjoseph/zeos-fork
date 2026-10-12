@@ -275,9 +275,11 @@ so a job can only mask interrupts for a short, bounded run.
   handler dispatch that reads the latest value (level-triggered, not
   edge-triggered).
 - **Throttling**: `min_interval` per vector.
-- **Starvation control**: if a low-priority job is preempted more than K times,
-  raise a scheduler fault (visible event, not silent aging -- real-time systems
-  should fail loudly).
+- **Starvation control**: if a low-priority job is preempted more than K times
+  without progress, raise a scheduler fault (visible event, not silent aging --
+  real-time systems should fail loudly). Progress is a write that lands, a read
+  that gets data, a lock taken or released, or a child spawned; gaining or
+  losing a body is not.
 - **Re-entrancy**: default `coalesce` or `queue`; `reentrant` only for
   handlers whose read/write sets are disjoint across instances. Under `queue`
   each firing's handler is handed the one write that fired it: a pipe remembers

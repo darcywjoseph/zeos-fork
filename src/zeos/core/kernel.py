@@ -280,7 +280,7 @@ class KernelError(RuntimeError):
 class KernelConfig:
     seed: int = 0
     case: str = "unnamed"
-    #: Preemptions before a job raises a starvation fault. Loud by design: real-time
+    #: Preemptions without progress before a starvation fault. Loud by design: real-time
     #: systems should fail visibly rather than silently age priorities (core §5.5).
     starvation_limit: int = 8
     #: Safety valve for ``run_until_quiescent``; a script that never exits is a bug,
@@ -945,7 +945,7 @@ class Kernel:
                     kind=FaultKind.STARVATION,
                     job=running.job_id,
                     detail=(
-                        f"preempted {running.preempt_count} times, over the "
+                        f"preempted {running.preempt_count} times without progress, over the "
                         f"limit of {self.config.starvation_limit}"
                     ),
                 ),
@@ -1479,6 +1479,8 @@ class Kernel:
                         f"of {job.descriptor.name}",
                         notice="the descriptor you named is not one this job may spawn",
                     )
+                    return
+                job.preempt_count = 0
             case OpKind.EXIT:
                 self._complete(job)
             case OpKind.FAULT:
@@ -2357,6 +2359,8 @@ class Kernel:
         if resource.acquire(job.job_id):
             job.held_resources.add(name)
             job.pending_acquire = None
+            if resource.spec.kind is not ResourceKind.LEASE:
+                job.preempt_count = 0
             self._emit(
                 ResourceAcquired(
                     clock=self.clock,
@@ -2424,6 +2428,8 @@ class Kernel:
         if not resource.release(job.job_id):
             return
         job.held_resources.discard(name)
+        if resource.spec.kind is not ResourceKind.LEASE:
+            job.preempt_count = 0
         self._release_priority_inheritance(job, only_for_resource=name)
 
         woken: JobId | None = None
@@ -2604,6 +2610,7 @@ class Kernel:
     def _consume_read(self, job: Job, pipe_name: PipeName) -> None:
         pipe = self.pipes.get(pipe_name)
         tokens, carried = pipe.take()
+        job.preempt_count = 0
         self._emit(
             PipeReadEvent(
                 clock=self.clock,
@@ -2760,6 +2767,7 @@ class Kernel:
             )
             self._park(job, pipe_name, "write-full", inherit=(pipe_name,), waiting_to_read=False)
             return
+        job.preempt_count = 0
 
         # The distribution seam. If the link carries this pipe, the tokens leave the
         # node; the far kernel sees them as an ordinary pipe write an RTT later. The
