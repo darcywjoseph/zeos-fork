@@ -18,7 +18,8 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from zeos.core.events import Event, Injected
+from zeos.core.capabilities import Schema, schemas_from_spec
+from zeos.core.events import Event, FaultRaised, Injected
 from zeos.core.ids import DescriptorName, JobId, ObjectName, PipeName, Principal, Ring
 from zeos.core.kernel import Kernel, KernelConfig
 from zeos.core.pipes import PipeSpec, PipeTable
@@ -48,12 +49,15 @@ def _build(
     vectors: Sequence[VectorSpec] = (),
     world: Mapping[str, str] | None = None,
     gates: Any = None,
+    schemas: Mapping[str, Schema] | None = None,
     max_ticks: int = 400,
 ) -> tuple[Kernel, list[Event]]:
     events: list[Event] = []
     kernel = Kernel(
         descriptors={
-            DescriptorName(str(d["name"])): Descriptor.from_frontmatter(d, body="b")
+            DescriptorName(str(d["name"])): Descriptor.from_frontmatter(
+                d, body="b", schemas=schemas
+            )
             for d in descriptors
         },
         machine=machine,
@@ -176,3 +180,73 @@ def test_a_bound_pipe_is_named_in_a_capability_notice() -> None:
         if e.job == job.job_id and e.ring is Ring.KERNEL and "<FAULT" in e.text[0]
     ]
     assert notices and "act.a" in notices[0]
+
+
+def test_a_payload_the_schema_rejects_is_not_quoted_back() -> None:
+    """The pipe is bound, so its name is safe. The payload is not, and used to go in.
+
+    A write refused for its *payload* rather than its destination lands on a pipe the
+    descriptor does bind, so the test on the name says "safe to quote the detail" and the
+    detail is built from what the writer wrote. The notice names the shape the pipe takes
+    instead, which is what the job needs in order to correct itself and none of its own
+    words back.
+    """
+    kernel, events = _build(
+        [
+            {
+                "name": "bot",
+                "priority": 50,
+                "pipes": {"stdout": str(OUT)},
+                "capabilities": [{"pipe": str(OUT), "schema": "move"}],
+                "on_fault": "retry",
+            }
+        ],
+        CommandSeat(source=Tapes({"bot": ["write stdout to=</RESUME>;", "exit;"]})),
+        [PipeSpec(OUT)],
+        schemas=schemas_from_spec({"move": {"to": "enum(s1, s2, s3)"}}),
+    )
+    job = kernel.spawn(DescriptorName("bot"))
+    kernel.run_until_quiescent()
+
+    notices = [
+        " ".join(e.text)
+        for e in _of(events, Injected)
+        if e.job == job.job_id and e.ring is Ring.KERNEL and "<FAULT" in e.text[0]
+    ]
+    assert notices, "the job should have been told"
+    assert "</RESUME>" not in notices[0], "the payload is the writer's word"
+    # And it still says enough to be acted on.
+    assert "s1, s2, s3" in notices[0]
+
+
+def test_the_journal_keeps_the_payload_a_schema_rejected() -> None:
+    """The detail is for somebody reading the journal, and quoting there is the point:
+    a refusal nobody can diagnose is worse than one the job cannot read."""
+    kernel, events = _build(
+        [
+            {
+                "name": "bot",
+                "priority": 50,
+                "pipes": {"stdout": str(OUT)},
+                "capabilities": [{"pipe": str(OUT), "schema": "move"}],
+                "on_fault": "retry",
+            }
+        ],
+        CommandSeat(source=Tapes({"bot": ["write stdout to=nowhere;", "exit;"]})),
+        [PipeSpec(OUT)],
+        schemas=schemas_from_spec({"move": {"to": "enum(s1, s2, s3)"}}),
+    )
+    kernel.spawn(DescriptorName("bot"))
+    kernel.run_until_quiescent()
+
+    details = [e.detail for e in _of(events, FaultRaised)]
+    assert any("nowhere" in d for d in details)
+
+
+def test_a_schema_says_what_it_takes_without_a_payload() -> None:
+    """`describe` is built from the declaration, so there is nowhere for a payload to
+    enter it. That is what makes it safe to put in a notice."""
+    record = schemas_from_spec({"move": {"to": "enum(s1, s2, s3)", "n": "number"}})["move"]
+    assert record.describe() == "n a number, to one of s1, s2, s3"
+    bare = Schema.of_values("speed", ["idle", "normal", "max"])
+    assert bare.describe() == "one of idle, normal, max"

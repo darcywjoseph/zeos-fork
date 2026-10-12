@@ -307,6 +307,7 @@ body.resizing { user-select: none; cursor: col-resize; }
 .chip rect { fill: var(--panel); stroke: var(--line); rx: 5; }
 .chip text { font: 10px ui-monospace, monospace; fill: var(--ink); }
 .chip .sub { fill: var(--dim); }
+.chip .device-name { font-weight: 600; }
 .chip.ring3 rect { stroke: var(--ring3); }
 .chip.ring2 rect { stroke: var(--ring2); }
 .chip.ring1 rect { stroke: var(--ring1); }

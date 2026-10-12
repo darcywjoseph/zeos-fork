@@ -24,7 +24,7 @@ crane, with none of it written twice.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 import pytest
@@ -40,6 +40,7 @@ from zeos.core.embodiment import (
 )
 from zeos.core.events import (
     AllocationRefused,
+    Decoded,
     Disembodied,
     Embodied,
     Event,
@@ -99,6 +100,7 @@ def build(
     descriptors: Sequence[Mapping[str, Any]],
     scripts: Mapping[str, list[dict[str, Any]]],
     platforms: Sequence[PlatformProfile] = FLEET,
+    on_event: Callable[[Event], None] | None = None,
 ) -> tuple[Kernel, list[Event]]:
     events: list[Event] = []
     kernel = Kernel(
@@ -112,6 +114,7 @@ def build(
         resources=ResourceTable(),
         platforms=platforms,
         journal_sink=events,
+        on_event=on_event,
         config=KernelConfig(case="f0"),
     )
     kernel.start()
@@ -129,6 +132,7 @@ CARRY = {
     "release_policy": "at-action-boundary",
 }
 WORK = [{"emit": "lifting"}, {"emit": "moving"}, {"emit": "placed"}, {"exit": True}]
+LONG_WORK = [{"emit": f"step-{n}"} for n in range(8)] + [{"exit": True}]
 
 
 # --- matching: feasibility versus cost --------------------------------------
@@ -226,6 +230,126 @@ def test_a_second_claimant_blocks_on_the_body() -> None:
     donated = [e for e in of(events, PriorityInherited) if e.job == holder.job_id]
     assert donated, "the holder must inherit the waiting job's urgency"
     assert "body:carrier-7" in donated[0].resource
+
+
+def test_a_more_urgent_claimant_takes_the_body() -> None:
+    """Per the Fleet design: "a higher mission takes the body; the loser suspends". The holder
+    gets the body back once the urgent job is done, and finishes."""
+    slow = dict(CARRY, name="slow-carry", priority=90)
+    urgent = dict(CARRY, name="urgent-carry", priority=10)
+    kernel, events = build(
+        [slow, urgent],
+        {"slow-carry": LONG_WORK, "urgent-carry": WORK},
+        platforms=(CARRIER_7,),  # one body, two claimants
+    )
+    holder = kernel.spawn(DescriptorName("slow-carry"))
+    kernel.tick()
+    kernel.tick()
+    claimant = kernel.spawn(DescriptorName("urgent-carry"))
+    kernel.run_until_quiescent()
+
+    taken = [
+        e for e in of(events, Disembodied) if e.job == holder.job_id and "outranks" in e.reason
+    ]
+    assert taken, "the holder must lose the body to the more urgent job"
+    assert f"job {claimant.job_id} (urgent-carry)" in taken[0].reason
+    wore = [e.job for e in of(events, Embodied)]
+    assert wore == [holder.job_id, claimant.job_id, holder.job_id], wore
+    assert holder.state is JobState.DONE and claimant.state is JobState.DONE
+
+
+def test_a_less_urgent_claimant_waits_for_the_body() -> None:
+    """Priority decides: a claimant that does not outrank the holder waits, as before."""
+    holder_spec = dict(CARRY, name="urgent-carry", priority=10)
+    claimant_spec = dict(CARRY, name="slow-carry", priority=90)
+    kernel, events = build(
+        [holder_spec, claimant_spec],
+        {"urgent-carry": LONG_WORK, "slow-carry": WORK},
+        platforms=(CARRIER_7,),
+    )
+    holder = kernel.spawn(DescriptorName("urgent-carry"))
+    kernel.tick()
+    kernel.tick()
+    claimant = kernel.spawn(DescriptorName("slow-carry"))
+    kernel.run_until_quiescent()
+
+    assert not [e for e in of(events, Disembodied) if "outranks" in e.reason]
+    lost = of(events, Disembodied)
+    assert lost[0].job == holder.job_id and lost[0].reason == "job completed"
+    assert [e.job for e in of(events, Embodied)] == [holder.job_id, claimant.job_id]
+
+
+def test_the_release_policy_sets_how_long_the_holder_keeps_the_body() -> None:
+    """The preemptibility declaration applied to flesh: ``immediate`` gives the body up at once,
+    ``at-plan-step`` keeps it for the policy's grace."""
+
+    def decodes_kept(policy: str) -> int:
+        slow = dict(CARRY, name="slow-carry", priority=90, release_policy=policy)
+        urgent = dict(CARRY, name="urgent-carry", priority=10)
+        kernel, events = build(
+            [slow, urgent],
+            {"slow-carry": LONG_WORK, "urgent-carry": WORK},
+            platforms=(CARRIER_7,),
+        )
+        holder = kernel.spawn(DescriptorName("slow-carry"))
+        kernel.tick()
+        kernel.tick()
+        kernel.spawn(DescriptorName("urgent-carry"))
+        kernel.run_until_quiescent()
+        taken = next(e for e in of(events, Disembodied) if "outranks" in e.reason)
+        asked = next(e for e in of(events, AllocationRefused))
+        return len(
+            [
+                e
+                for e in of(events, Decoded)
+                if e.job == holder.job_id
+                and asked.clock.token_clock <= e.clock.token_clock < taken.clock.token_clock
+            ]
+        )
+
+    at_once = decodes_kept(ReleasePolicy.IMMEDIATE)
+    after_grace = decodes_kept(ReleasePolicy.PLAN_STEP)
+    assert at_once == 0, at_once
+    assert after_grace >= ReleasePolicy.grace(ReleasePolicy.PLAN_STEP) - 1, after_grace
+
+
+def test_a_driver_hears_the_body_being_taken_as_it_happens() -> None:
+    """The platform is the body's driver, and a revocation must reach it at once: with a seat
+    that blocks inside ``tick``, the journal is read too late to stop what the body was doing."""
+    heard: list[tuple[int, bool]] = []
+    box: dict[str, Kernel] = {}
+
+    def hear(event: Event) -> None:
+        if isinstance(event, Disembodied) and "outranks" in event.reason:
+            kernel = box["kernel"]
+            heard.append((len(kernel.events), kernel.leases.lease_of(event.job) is None))
+
+    slow = dict(CARRY, name="slow-carry", priority=90)
+    urgent = dict(CARRY, name="urgent-carry", priority=10)
+    kernel, events = build(
+        [slow, urgent],
+        {"slow-carry": LONG_WORK, "urgent-carry": WORK},
+        platforms=(CARRIER_7,),
+        on_event=hear,
+    )
+    box["kernel"] = kernel
+    holder = kernel.spawn(DescriptorName("slow-carry"))
+    kernel.tick()
+    kernel.tick()
+    claimant = kernel.spawn(DescriptorName("urgent-carry"))
+    kernel.run_until_quiescent()
+
+    taken = next(
+        i for i, e in enumerate(events) if isinstance(e, Disembodied) and "outranks" in e.reason
+    )
+    regranted = next(
+        i for i, e in enumerate(events) if isinstance(e, Embodied) and e.job == claimant.job_id
+    )
+    assert heard == [(taken + 1, True)], (
+        heard
+    )  # told as the event is journalled, the lease already gone
+    assert taken < regranted
+    assert holder.state is JobState.DONE
 
 
 def test_completion_returns_the_body() -> None:

@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import math
 import sys
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 
 from zeos.core.allocator import (
@@ -40,6 +40,7 @@ from zeos.core.allocator import (
     GreedyAllocator,
     Lease,
     LeaseBook,
+    ReleasePolicy,
     self_state,
 )
 from zeos.core.capabilities import Capability, CapabilityTable, check_write
@@ -70,6 +71,7 @@ from zeos.core.events import (
     Endorsed,
     Event,
     FaultDispatched,
+    FaultEscalated,
     FaultRaised,
     Forked,
     FrameSent,
@@ -129,7 +131,7 @@ from zeos.core.events import (
     WorkingSetSampled,
     WorldWritten,
 )
-from zeos.core.faults import Fault, FaultAction, resolve
+from zeos.core.faults import Fault, FaultAction, render_escalation, resolve
 from zeos.core.framing import frame_tokens, imitates_frame
 from zeos.core.gates import (
     ALLOW,
@@ -278,7 +280,7 @@ class KernelError(RuntimeError):
 class KernelConfig:
     seed: int = 0
     case: str = "unnamed"
-    #: Preemptions before a job raises a starvation fault. Loud by design: real-time
+    #: Preemptions without progress before a starvation fault. Loud by design: real-time
     #: systems should fail visibly rather than silently age priorities (core §5.5).
     starvation_limit: int = 8
     #: Safety valve for ``run_until_quiescent``; a script that never exits is a bug,
@@ -299,6 +301,7 @@ class _Counters:
     next_job_id: int = 1
     next_seq: int = 0
     next_segment: int = 1
+    ticks: int = 0
 
 
 #: The notice for a write outside what the job may write: it names, never quotes.
@@ -323,6 +326,7 @@ class Kernel:
         topology: Topology | None = None,
         link: LinkPort | None = None,
         journal_sink: list[Event] | None = None,
+        on_event: Callable[[Event], None] | None = None,
         config: KernelConfig | None = None,
     ) -> None:
         self.descriptors = dict(descriptors)
@@ -354,6 +358,7 @@ class Kernel:
         self.store = SpanStore()
         self.pager = Pager(self.store)
         self._events: list[Event] = journal_sink if journal_sink is not None else []
+        self._on_event = on_event
         self._counters = _Counters()
         self._started = False
 
@@ -364,7 +369,12 @@ class Kernel:
         return self._events
 
     def _emit(self, event: Event) -> None:
+        """Journal the event, then tell the driver that asked to hear events as they
+        happen. The call is made here, on the kernel's thread, so a driver can act
+        the moment a body is taken from its job rather than once ``tick`` returns."""
         self._events.append(event)
+        if self._on_event is not None:
+            self._on_event(event)
         if self.config.trace_decode and isinstance(event, Decoded):
             print(
                 f"[t={event.clock.token_clock}] job {event.job} seg {event.segment}: "
@@ -805,8 +815,10 @@ class Kernel:
         if not self._started:
             raise KernelError("call start() before tick()")
 
+        self._counters.ticks += 1
         self._expire_elevations()
         self._expire_gates()
+        self._enforce_revocations()
         self._dispatch_due_vectors()
 
         contender = self.sched.should_preempt()
@@ -820,7 +832,7 @@ class Kernel:
 
         job = self.sched.running
         if job is None:
-            return False
+            return bool(self.leases.revoking)
 
         if self._check_budget(job):
             return True
@@ -933,7 +945,7 @@ class Kernel:
                     kind=FaultKind.STARVATION,
                     job=running.job_id,
                     detail=(
-                        f"preempted {running.preempt_count} times, over the "
+                        f"preempted {running.preempt_count} times without progress, over the "
                         f"limit of {self.config.starvation_limit}"
                     ),
                 ),
@@ -1467,6 +1479,8 @@ class Kernel:
                         f"of {job.descriptor.name}",
                         notice="the descriptor you named is not one this job may spawn",
                     )
+                    return
+                job.preempt_count = 0
             case OpKind.EXIT:
                 self._complete(job)
             case OpKind.FAULT:
@@ -1569,8 +1583,44 @@ class Kernel:
                 ),
             )
             return False
-        self._do_acquire(job, lease_name(allocation.candidates[0].platform))
+        platform = allocation.candidates[0].platform
+        self._claim_body(job, platform)
+        self._do_acquire(job, lease_name(platform))
         return False
+
+    def _claim_body(self, job: Job, platform: str) -> None:
+        """A more urgent job needs a body another holds: the holder's lease is revoked,
+        after the grace its release policy allows.
+
+        Per the Fleet design, body preemption follows the rule of token preemption: a
+        higher mission takes the body and the loser suspends. Base priorities decide,
+        as for a deadlock victim: by now inheritance has lent the holder the waiter's
+        own priority. The revocation is booked here and enforced by ``tick`` once
+        due; the waiter blocks on the lease meanwhile and is woken by the release.
+        """
+        lease = self.leases.leases.get(platform)
+        if lease is None or platform in self.leases.revoking or not self.sched.has(lease.job):
+            return
+        holder = self.sched.get(lease.job)
+        if job.base_priority < holder.base_priority:
+            grace = ReleasePolicy.grace(lease.release_policy)
+            self.leases.revoking[platform] = self._counters.ticks + grace
+
+    def _enforce_revocations(self) -> None:
+        """Every tick: a booked revocation whose grace has passed takes the body back,
+        for the most urgent job waiting on its lease. If nobody waits any more, the
+        booking is dropped and the holder keeps the body."""
+        for platform, due in list(self.leases.revoking.items()):
+            if self._counters.ticks < due:
+                continue
+            waiter = self.resources.next_waiter(lease_name(platform), self._priorities())
+            if waiter is None or not self.sched.has(waiter):
+                self.leases.revoking.pop(platform, None)
+                continue
+            claimant = self.sched.get(waiter)
+            self.revoke_lease(
+                platform, reason=f"job {claimant.job_id} ({claimant.name}) outranks the holder"
+            )
 
     def _grant_lease(self, job: Job, platform: str, release_policy: str, gang: str) -> None:
         profile = self.leases.profiles[platform]
@@ -2309,6 +2359,8 @@ class Kernel:
         if resource.acquire(job.job_id):
             job.held_resources.add(name)
             job.pending_acquire = None
+            if resource.spec.kind is not ResourceKind.LEASE:
+                job.preempt_count = 0
             self._emit(
                 ResourceAcquired(
                     clock=self.clock,
@@ -2376,6 +2428,8 @@ class Kernel:
         if not resource.release(job.job_id):
             return
         job.held_resources.discard(name)
+        if resource.spec.kind is not ResourceKind.LEASE:
+            job.preempt_count = 0
         self._release_priority_inheritance(job, only_for_resource=name)
 
         woken: JobId | None = None
@@ -2556,6 +2610,7 @@ class Kernel:
     def _consume_read(self, job: Job, pipe_name: PipeName) -> None:
         pipe = self.pipes.get(pipe_name)
         tokens, carried = pipe.take()
+        job.preempt_count = 0
         self._emit(
             PipeReadEvent(
                 clock=self.clock,
@@ -2638,13 +2693,20 @@ class Kernel:
         if not check.allowed:
             # A pipe the descriptor binds is the author's word; any other name is the
             # model's, and the notice must not repeat it.
+            #
+            # That settles the pipe *name*, and not everything else a detail may quote. A
+            # write refused for its payload rather than its destination is refused on a
+            # pipe the descriptor does bind, so the name is safe and the payload is not:
+            # `check.notice` is how a check that knows its detail quotes the writer says
+            # so, and it wins over the test on the name.
             bound = pipe_name in job.descriptor.pipes.all_names()
             history = self._demotion_history(job)
+            notice = check.notice if check.notice is not None else (None if bound else NOT_WRITABLE)
             self._refuse(
                 job,
                 check.fault or FaultKind.CAPABILITY,
                 check.detail + history,
-                notice=None if bound else NOT_WRITABLE + history,
+                notice=None if notice is None else notice + history,
                 pipe=pipe_name,
             )
             return
@@ -2705,6 +2767,7 @@ class Kernel:
             )
             self._park(job, pipe_name, "write-full", inherit=(pipe_name,), waiting_to_read=False)
             return
+        job.preempt_count = 0
 
         # The distribution seam. If the link carries this pipe, the tokens leave the
         # node; the far kernel sees them as an ordinary pipe write an RTT later. The
@@ -3040,16 +3103,20 @@ class Kernel:
     def _wake_writers(self, pipe: Pipe) -> None:
         """Space freed: anyone blocked writing to this pipe may now proceed."""
         for woken in self.sched.wake_all(pipe.take_waiting_writers()):
-            self._release_priority_inheritance(woken)
-            self._emit(JobWoken(clock=self.clock, job=woken.job_id, pipe=pipe.name))
-            self._emit(
-                JobStateChanged(
-                    clock=self.clock,
-                    job=woken.job_id,
-                    from_state=JobState.BLOCKED,
-                    to_state=JobState.READY,
-                )
+            self._woken(woken, pipe.name)
+
+    def _woken(self, job: Job, pipe_name: PipeName) -> None:
+        """Journal a wake from a pipe and hand back any priority the job lent."""
+        self._release_priority_inheritance(job)
+        self._emit(JobWoken(clock=self.clock, job=job.job_id, pipe=pipe_name))
+        self._emit(
+            JobStateChanged(
+                clock=self.clock,
+                job=job.job_id,
+                from_state=JobState.BLOCKED,
+                to_state=JobState.READY,
             )
+        )
 
     def _wake_readers(self, pipe_name: PipeName) -> None:
         # A pinned job has never run, so it is not among the pipe's blocked readers:
@@ -3069,16 +3136,7 @@ class Kernel:
             self._consume_read(pinned, pipe_name)
         pipe = self.pipes.get(pipe_name)
         for woken in self.sched.wake_all(pipe.take_waiting_readers()):
-            self._release_priority_inheritance(woken)
-            self._emit(JobWoken(clock=self.clock, job=woken.job_id, pipe=pipe_name))
-            self._emit(
-                JobStateChanged(
-                    clock=self.clock,
-                    job=woken.job_id,
-                    from_state=JobState.BLOCKED,
-                    to_state=JobState.READY,
-                )
-            )
+            self._woken(woken, pipe_name)
 
     def _apply_world_write(
         self,
@@ -3380,8 +3438,8 @@ class Kernel:
         its content is ``world.get(obj)``, and the replacement is about to be appended
         -- so there is nothing to spill and nothing to fault back. Handing it to the
         pager instead does not work even in principle: ``stub_size`` is
-        ``STUB_FRAMING_TOKENS + max(2, n // 8)``, which exceeds ``n`` for any span
-        under about eleven tokens, so ``plan_eviction`` computes ``freed <= 0``, marks
+        ``STUB_FRAMING_TOKENS + max(2, n // 8)``, which is no smaller than ``n`` for any
+        span up to thirteen tokens, so ``plan_eviction`` computes ``freed <= 0``, marks
         the candidate net-negative and declines it at every boundary for the life of
         the job. Demotion alone closes the leak on paper only.
 
@@ -3708,9 +3766,35 @@ class Kernel:
                 self._transition(job, JobState.FAULTED)
                 self._return_body(job, reason="job faulted")
                 self._release_held_resources(job)
+                if resolution.action is FaultAction.ESCALATE:
+                    self._escalate(job, fault)
             case FaultAction.DISPATCH_HANDLER:
                 self._inject_kernel(job, resolution.notice)
                 if resolution.handler is not None:
                     self.spawn(resolution.handler, parent=job.job_id)
             case FaultAction.CONTINUE | FaultAction.RETRY:
                 self._inject_kernel(job, resolution.notice)
+
+    def _escalate(self, child: Job, fault: Fault) -> None:
+        """Tell a live parent its child faulted, and wake it if it is parked on a read."""
+        if child.parent is None or not self.sched.has(child.parent):
+            return
+        parent = self.sched.get(child.parent)
+        if parent.state.is_terminal:
+            return
+        self._emit(
+            FaultEscalated(
+                clock=self.clock, job=parent.job_id, child=child.job_id, fault=fault.kind
+            )
+        )
+        self._inject_kernel(parent, render_escalation(fault, child.name))
+        waiting = parent.pending_select or ((parent.pending_read,) if parent.pending_read else ())
+        if parent.state is not JobState.BLOCKED or not waiting:
+            return
+        # A woken reader would retry its read and park again, so the read is dropped.
+        for name in waiting:
+            self.pipes.get(name).unblock(parent.job_id)
+        parent.pending_read = None
+        parent.pending_select = ()
+        self.sched.wake(parent)
+        self._woken(parent, waiting[0])

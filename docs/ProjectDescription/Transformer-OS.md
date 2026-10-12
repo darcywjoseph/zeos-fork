@@ -275,9 +275,11 @@ so a job can only mask interrupts for a short, bounded run.
   handler dispatch that reads the latest value (level-triggered, not
   edge-triggered).
 - **Throttling**: `min_interval` per vector.
-- **Starvation control**: if a low-priority job is preempted more than K times,
-  raise a scheduler fault (visible event, not silent aging -- real-time systems
-  should fail loudly).
+- **Starvation control**: if a low-priority job is preempted more than K times
+  without progress, raise a scheduler fault (visible event, not silent aging --
+  real-time systems should fail loudly). Progress is a write that lands, a read
+  that gets data, a lock taken or released, or a child spawned; gaining or
+  losing a body is not.
 - **Re-entrancy**: default `coalesce` or `queue`; `reentrant` only for
   handlers whose read/write sets are disjoint across instances. Under `queue`
   each firing's handler is handed the one write that fired it: a pipe remembers
@@ -334,6 +336,9 @@ need training?
 - Faults (budget exceeded, tool error, deadline miss, scheduler starvation)
   are interrupts targeting the faulting job's `on_fault` policy -- same
   mechanism, so error handling is also just descriptors.
+- `escalate`, the default, ends the job as `abort` does and tells its parent: a
+  `<FAULT kind=… child=…>` notice in the parent's context, which also wakes a
+  parent waiting on a read. A job with no live parent is only ended.
 
 ## Appendix A -- Scheduler state machine
 

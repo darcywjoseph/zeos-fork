@@ -30,7 +30,14 @@ from dataclasses import dataclass
 from zeos.core.ids import DescriptorName, FaultKind, JobId, OnFault, PipeName, SegmentId
 from zeos.descriptor.schema import FaultPolicy
 
-__all__ = ["Fault", "FaultAction", "FaultResolution", "resolve", "render_notice"]
+__all__ = [
+    "Fault",
+    "FaultAction",
+    "FaultResolution",
+    "resolve",
+    "render_notice",
+    "render_escalation",
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,3 +120,15 @@ def render_notice(fault: Fault) -> str:
             parts.append(f"offending pipe: {fault.pipe}")
     parts.append("</FAULT>")
     return " ".join(parts)
+
+
+def render_escalation(fault: Fault, child: DescriptorName) -> str:
+    """The ring-0 text a parent receives when its child faults under ``escalate``.
+
+    It names the child and the kind and never carries the child's detail, which can
+    quote words the child chose.
+    """
+    return (
+        f"<FAULT kind={fault.kind.value} child={child}> your child {child} faulted "
+        f"and was stopped </FAULT>"
+    )

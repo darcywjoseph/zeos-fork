@@ -100,6 +100,7 @@ def build_kernel(
     *,
     machine: MachineBackend | None = None,
     journal_sink: list[Event] | None = None,
+    on_event: Callable[[Event], None] | None = None,
     config: KernelConfig | None = None,
     block_size: int = 16,
 ) -> tuple[Kernel, PipeTransport]:
@@ -119,6 +120,7 @@ def build_kernel(
         principals=bundle.principals,
         gates=bundle.gates,
         journal_sink=journal_sink,
+        on_event=on_event,
         config=config or KernelConfig(case=bundle.name),
     )
     for obj, value in sorted(bundle.world.items()):
