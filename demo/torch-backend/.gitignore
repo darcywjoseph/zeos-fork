@@ -1,0 +1,3 @@
+# Weights, fetched with `uv run zeos-torch fetch-model`.
+# No trailing slash, so a symlink to a shared download is ignored too.
+/models
