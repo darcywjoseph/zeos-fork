@@ -1,0 +1,60 @@
+[project]
+name = "zeos-torch"
+version = "0.1.0"
+description = "A PyTorch MachineBackend for ZEOS that runs a Hugging Face model with eager attention"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "zeos",
+    # Pinned to a minor: the KV cache API this backend cuts with (`DynamicCache.crop`)
+    # changed meaning within the 5.x series.
+    "torch==2.14.*",
+    "transformers==5.19.*",
+    "huggingface-hub>=1.0",
+]
+
+[project.scripts]
+zeos-torch = "zeos_torch.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pyright>=1.1.390",
+    "mypy>=1.15",
+]
+
+[tool.uv.sources]
+zeos = { workspace = true }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/zeos_torch"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --strict-markers"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "UP", "B"]
+
+[tool.ruff.lint.per-file-ignores]
+# The machine contract requires a destroyed context to raise; which exception type is
+# the backend's business, so the blind pytest.raises is deliberate.
+"tests/test_machine_contract.py" = ["B017"]
+
+[tool.pyright]
+include = ["src", "tests"]
+pythonVersion = "3.12"
+typeCheckingMode = "strict"
+reportMissingTypeStubs = false
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
